@@ -2,6 +2,8 @@
 # du output analyzer
 # by Ezra Stevens
 
+# Do what you like with the code, but don't hold me responsible.
+
 require 'optparse'
 
 $abs_threshold = 0
@@ -51,6 +53,53 @@ class Integer
 
   alias_method :to_sf, :to_s_commas
 end
+
+# Method for getting file lines in reverse
+# Must seek to end of file before calling
+# Intended to be equivalent to File#readlines.reverse, except without
+#   needing to have the entire file contents in memory at once
+class File
+  def each_reverse(chunk_size = 4294967296)
+    return nil if self.pos == 0
+    
+    initial_pos = self.pos
+    
+    lines = Array.new
+    tail = nil
+    done = false
+    
+    sep = $/.encode(self.external_encoding)
+    
+    until self.pos == 0
+      # read chunk_size bytes of data prior to the cursor location
+      self.pos = [self.pos - chunk_size, 0].max
+      chunk = self.read( (self.pos == 0 && initial_pos % chunk_size != 0) ? initial_pos % chunk_size : chunk_size)
+      
+      # break it up the usual way
+      lines = chunk.split(sep,-1)
+      if(tail)
+        lines[-1] += tail
+      else
+        lines.pop if lines[-1].empty? # newline at EOF shouldn't count for a blank line,
+      end                             #   so as to be in accordance with IO#each
+
+      # yield what lines we can      
+      while(lines.count > 1)
+        yield((lines.pop + sep).force_encoding(self.external_encoding))
+      end
+
+      # the "tail" at the beginning of a chunk may be an incomplete line;
+      #   save it for later
+      tail = lines[0]
+      
+      self.pos = [self.pos - chunk_size, 0].max
+    end
+    yield((tail + sep).force_encoding(self.external_encoding))
+    
+    return self
+  end
+end
+
 
 # A file or folder - basically contains the info from a single line of du output
 class Node
@@ -110,44 +159,36 @@ class Node
 end
 
 # let's get to parsing
-print 'Reading ' + $inputFile + '...'
-lines = File.open($inputFile) {|file| file.readlines}
-print ' ' + lines.length.to_s + " lines read.\n"
-#sometimes foreign characters make regexps sad. There's probably a proper way to handle that
-#but character encodings are scary so I'll just destroy anything that isn't ASCII.
-lines.map! {|ll| ll.encode(Encoding::UTF_8, 'binary', :invalid => :replace, :undef => :replace)}
+File.open($inputFile) do |file|
 
-unless lines.empty?
-  rootLine = lines.pop
-  #don't include the trailing slash in the root node name, if present. It's okay for the root node name to be "".
-  raise('Format Error: '+rootLine) unless rootLine =~ /^([0-9]+)\s+(.*?)\/?$/
-  currentNode = $rootNode = Node.new($2.strip,nil,$1.to_i)
-
-  $threshold = [($rel_threshold * $1.to_i).to_i, $abs_threshold].max
-  
-  count = 0
-  step = [lines.length / 10, 50_000].min
-  begin
-    # go through everything backwards so that nodes are created in hierarchical order -
-    # du lists directories after their contents
-    lines.reverse_each do |ll|
+  begin 
+    currentNode = nil
+    count = 0
+    step = 50_000
+    
+    file.pos = file.size
+    file.each_reverse do |line|
       count += 1
-      
-      # ignore small files
-      unless(ll.to_i < $threshold)
-        until ll =~ /^([0-9]+)\s+#{Regexp.escape(currentNode.fullName)}(\/.+)$/
-          currentNode = currentNode.parent
-          raise('Format error: '+ll) unless currentNode
+      if(!$rootNode)
+        raise('Format Error: '+line) unless line =~ /^([0-9]+)\s+(.*?)\/?$/
+        currentNode = $rootNode = Node.new($2.strip,nil,$1.to_i)
+        $threshold = [($rel_threshold * $1.to_i).to_i, $abs_threshold].max
+      else
+        # ignore small files
+        unless(line.to_i < $threshold)
+          until line =~ /^([0-9]+)\s+#{Regexp.escape(currentNode.fullName)}(\/.+)$/
+            currentNode = currentNode.parent
+            raise('Format error: '+line) unless currentNode
+          end
+          currentNode = Node.new($2.strip, currentNode, $1.to_i)
+    
+          # throw out some output every once in a while to reassure our user we haven't fallen in a well
+          puts(count.to_s + ' nodes created.') if(count % step == 0)
         end
-        currentNode = Node.new($2.strip, currentNode, $1.to_i)
-
-        # throw out some output every once in a while to reassure our user we haven't fallen in a well
-        puts(count.to_s + ' nodes created.') if(count % step == 0)
       end
     end
-    
   rescue Exception => ee
-    $stderr.puts('Error at node '+count.to_s+ "\n  "+lines[lines.length - count])
+    $stderr.puts('Error at node '+count.to_s)
     raise ee
   end
 end
